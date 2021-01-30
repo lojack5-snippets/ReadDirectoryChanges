@@ -3,57 +3,12 @@ import re
 
 import cffi
 
-## Mostly copied from trio/_core/_windows_cffi.py
-## with additions needed for ReadDirectoryChangesW
-## using IOCP
+from trio._core._io_windows import ffi, kernel32
+
+## Additional definitions needed to trio's FFI instance
+## Mising FFI instances can cause issues, so reuse trio's
 LIB = """
-// https://msdn.microsoft.com/en-us/library/windows/desktop/aa383751(v=vs.85).aspx
-typedef int BOOL;
-typedef unsigned char BYTE;
-typedef BYTE BOOLEAN;
-typedef void* PVOID;
-typedef PVOID HANDLE;
-typedef unsigned long DWORD;
-typedef unsigned long ULONG;
-typedef unsigned int NTSTATUS;
-typedef unsigned long u_long;
-typedef ULONG *PULONG;
-typedef const void *LPCVOID;
-typedef void *LPVOID;
-typedef const wchar_t *LPCWSTR;
-
-typedef uintptr_t ULONG_PTR;
-typedef uintptr_t UINT_PTR;
-
-typedef UINT_PTR SOCKET;
-
-typedef struct _OVERLAPPED {
-    ULONG_PTR Internal;
-    ULONG_PTR InternalHigh;
-    union {
-        struct {
-            DWORD Offset;
-            DWORD OffsetHigh;
-        } DUMMYSTRUCTNAME;
-        PVOID Pointer;
-    } DUMMYUNIONNAME;
-
-    HANDLE  hEvent;
-} OVERLAPPED, *LPOVERLAPPED;
-
-typedef OVERLAPPED WSAOVERLAPPED;
-typedef LPOVERLAPPED LPWSAOVERLAPPED;
-typedef PVOID LPSECURITY_ATTRIBUTES;
-typedef PVOID LPCSTR;
-
 typedef void (LPOVERLAPPED_COMPLETION_ROUTINE)(DWORD dwErrorCode, DWORD dwNumberOfBytesTransfered, LPOVERLAPPED lpOverlapped);
-
-typedef struct _OVERLAPPED_ENTRY {
-    ULONG_PTR lpCompletionKey;
-    LPOVERLAPPED lpOverlapped;
-    ULONG_PTR Internal;
-    DWORD dwNumberOfBytesTransferred;
-} OVERLAPPED_ENTRY, *LPOVERLAPPED_ENTRY;
 
 BOOL ReadDirectoryChangesW(
   HANDLE hDirectory,
@@ -72,59 +27,15 @@ typedef struct _FILE_NOTIFY_INFORMATION {
   DWORD FileNameLength;
   WCHAR FileName[];
 } FILE_NOTIFY_INFORMATION, *PFILE_NOTIFY_INFORMATION;
-
-HANDLE CreateFileW(
-  LPCWSTR               lpFileName,
-  DWORD                 dwDesiredAccess,
-  DWORD                 dwShareMode,
-  LPSECURITY_ATTRIBUTES lpSecurityAttributes,
-  DWORD                 dwCreationDisposition,
-  DWORD                 dwFlagsAndAttributes,
-  HANDLE                hTemplateFile
-);
-
-BOOL WINAPI CloseHandle(
-  _In_ HANDLE hObject
-);
-
-BOOL WINAPI CancelIoEx(
-  _In_     HANDLE       hFile,
-  _In_opt_ LPOVERLAPPED lpOverlapped
-);
-
-BOOL WriteFile(
-  HANDLE       hFile,
-  LPCVOID      lpBuffer,
-  DWORD        nNumberOfBytesToWrite,
-  LPDWORD      lpNumberOfBytesWritten,
-  LPOVERLAPPED lpOverlapped
-);
-
-BOOL ReadFile(
-  HANDLE       hFile,
-  LPVOID       lpBuffer,
-  DWORD        nNumberOfBytesToRead,
-  LPDWORD      lpNumberOfBytesRead,
-  LPOVERLAPPED lpOverlapped
-);
 """
-
-# cribbed from pywincffi
-# programmatically strips out those annotations MSDN likes, like _In_
-REGEX_SAL_ANNOTATION = re.compile(
-    r"\b(_In_|_Inout_|_Out_|_Outptr_|_Reserved_)(opt_)?\b"
-)
-LIB = REGEX_SAL_ANNOTATION.sub(" ", LIB)
-
-
-ffi = cffi.FFI()
-ffi.cdef(LIB)
-
-
-kernel32 = ffi.dlopen("kernel32.dll")
+ffi.cdef(LIB, override=True)
 
 
 INVALID_HANDLE_VALUE = ffi.cast("HANDLE", -1)
+
+
+class ErrorCodes(enum.IntEnum):
+    ERROR_NOTIFY_ENUM_DIR = 1022
 
 
 class FileFlags(enum.IntEnum):
@@ -163,3 +74,15 @@ class FileAction(enum.IntEnum):
 
 def unpack_pascal_string(string_pointer, string_length):
     return ffi.buffer(string_pointer, string_length)[:].decode('utf-16le')
+
+
+def get_winerror(winerror=None, *, filename=None, filename2=None):
+    if winerror is None:
+        winerror, msg = ffi.getwinerror()
+    else:
+        _, msg = ffi.getwinerror(winerror)
+    # https://docs.python.org/3/library/exceptions.html#OSError
+    return OSError(0, msg, filename, winerror, filename2)
+
+def raise_winerror(winerror=None, *, filename=None, filename2=None):
+    raise get_winerror(winerror, filename=filename, filename2=filename2)
