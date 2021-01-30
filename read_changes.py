@@ -1,5 +1,6 @@
 from functools import partial
 from pathlib import Path
+import math
 
 import trio
 
@@ -7,10 +8,13 @@ from _windows_cffi import (
     ffi,
     kernel32,
     INVALID_HANDLE_VALUE,
+    ErrorCodes,
     FileFlags,
     FileNotifyFlags,
     FileAction,
     unpack_pascal_string,
+    raise_winerror,
+    get_winerror,
 )
 
 class NativeEvent:
@@ -45,16 +49,21 @@ class NativeEvent:
 class WatchError(Exception):
     pass
 
+class ScanNeededError(WatchError):
+    def __init__(self):
+        super().__init__('Changes occurred but could not be stored in the internal buffer.  A manual scan of the target needs to be performed.')
+
 
 class Watcher:
-    def __init__(self, buffer_size=2**10):
-        self.buffer_size = buffer_size
-        self.buffer = ffi.from_buffer(bytearray(buffer_size))
+    def __init__(self, initial_buffer_size=2**10):
+        self.buffer_size = initial_buffer_size
         self.listeners = []
         self._native_events = []
 
     def register_listener(self, listener):
-        self.listeners.append(listener)
+        send_channel, recieve_channel = trio.open_memory_channel(math.inf)
+        self.listeners.append(send_channel)
+        listener.set_recieve_channel(recieve_channel)
 
     @staticmethod
     def _create_handle(path_name):
@@ -77,8 +86,7 @@ class Watcher:
             ffi.NULL,
         )
         if handle == INVALID_HANDLE_VALUE:
-            ## TODO: get details of the error using GetLastError
-            raise WatchHandle(f'Could not create file handle: {path_name}')
+            raise_winerror()
         return handle
 
     def _read_directory_changes(self, handle, overlapped):
@@ -92,9 +100,12 @@ class Watcher:
                       FileNotifyFlags.FILE_NOTIFY_CHANGE_LAST_ACCESS |
                       FileNotifyFlags.FILE_NOTIFY_CHANGE_CREATION
         )
+        # Use a fresh buffer for each call, so a single watcher can enter
+        # 'watch' multiple times
+        buffer =  ffi.from_buffer(bytearray(self.buffer_size))
         result = kernel32.ReadDirectoryChangesW(
             handle,
-            self.buffer,
+            buffer,
             self.buffer_size,
             True,       # bWatchSubtree
             watchFlags,
@@ -103,14 +114,13 @@ class Watcher:
             ffi.NULL,   # lpCompletionRoutine -> unused here
         )
         if result == 0:
-            # Indicates error
-            # TODO: GetLastError
-            raise WatchError('ReadDirectoryChanges failed')
+            raise_winerror()
+        return buffer
 
-    def _read_buffer(self, number_of_bytes):
+    def _read_buffer(self, buffer, number_of_bytes):
         offset = 0
         while offset < number_of_bytes:
-            notify_info = ffi.cast('PFILE_NOTIFY_INFORMATION', self.buffer[offset:number_of_bytes])
+            notify_info = ffi.cast('PFILE_NOTIFY_INFORMATION', buffer[offset:number_of_bytes])
             self._native_events.append(NativeEvent(notify_info))
             offset = notify_info.NextEntryOffset
             if offset == 0:
@@ -129,15 +139,26 @@ class Watcher:
         self._native_events = []
         while True:
             # Notify windows we want to ReadDirectoryChanges with results delivered via IOCP
-            self._read_directory_changes(handle, overlapped)
+            buffer = self._read_directory_changes(handle, overlapped)
             # And await the results
-            result = await trio.lowlevel.wait_overlapped(handle, overlapped)
+            try:
+                result = await trio.lowlevel.wait_overlapped(handle, overlapped)
+            except OSError as e:
+                if e.winerror == ErrorCodes.ERROR_NOTIFY_ENUM_DIR:
+                    # The buffer was not large enough, we need to manually walk the directory
+                    # to find the changes.
+                    # Raise the buffer size to avoid this next call
+                    self.buffer_size *= 2
+                    # And notify the user that they need to walk.
+                    raise ScanNeededError() from None
+                else:
+                    raise e from None
             # Unpack the file notify informations
-            self._read_buffer(result.dwNumberOfBytesTransferred)
+            self._read_buffer(buffer, result.dwNumberOfBytesTransferred)
             # Send the events to the listeners
             for event in self._native_events:
                 for listener in self.listeners:
-                    await listener.on_event(event)
+                    await listener.send(event)
             self._native_events.clear()
             ## TODO: convert events to a higher level representation,
             ## for example folding rename_old and rename_new events into
@@ -146,6 +167,16 @@ class Watcher:
 
 
 class Listener:
+    def __init__(self):
+        self.recieve_channel = None
+
+    def set_recieve_channel(self, recieve_channel):
+        self.recieve_channel = recieve_channel
+
+    async def listen(self):
+        async for event in self.recieve_channel:
+            await self.on_event(event)
+
     async def on_event(self, event):
         if event.is_added:
             await self.on_added(event.path)
@@ -189,6 +220,7 @@ async def main(directory):
         listener = PrintListener()
         watcher = Watcher()
         watcher.register_listener(listener)
+        nursery.start_soon(listener.listen)
         nursery.start_soon(partial(watcher.watch, directory))
 
 
