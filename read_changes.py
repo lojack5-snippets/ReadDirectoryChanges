@@ -1,4 +1,5 @@
 import math
+import os
 
 import trio
 
@@ -72,7 +73,7 @@ class FileHandle:
     """
     def __init__(self, path_name):
         # Encode the file name
-        rawname = str(path_name).encode('utf-16le') + b'\0\0'
+        rawname = os.fspath(path_name).encode('utf-16le') + b'\0\0'
         rawname = ffi.from_buffer(rawname)
         # share flags: allow other processes to read, write, and delete the file
         fileShareFlags = FileFlags.FILE_SHARE_READ | FileFlags.FILE_SHARE_WRITE | FileFlags.FILE_SHARE_DELETE
