@@ -1,12 +1,9 @@
 import enum
-import re
-
-import cffi
 
 from trio._core._io_windows import ffi, kernel32
 
 ## Additional definitions needed to trio's FFI instance
-## Mising FFI instances can cause issues, so reuse trio's
+## Mixing FFI instances can cause issues, so reuse trio's
 LIB = """
 typedef void (LPOVERLAPPED_COMPLETION_ROUTINE)(DWORD dwErrorCode, DWORD dwNumberOfBytesTransfered, LPOVERLAPPED lpOverlapped);
 
@@ -32,7 +29,7 @@ ffi.cdef(LIB, override=True)
 
 
 INVALID_HANDLE_VALUE = ffi.cast("HANDLE", -1)
-
+ULONG_MAX = ffi.cast('ULONG', -1)
 
 class ErrorCodes(enum.IntEnum):
     ERROR_NOTIFY_ENUM_DIR = 1022
