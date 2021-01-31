@@ -8,6 +8,7 @@ from _windows_cffi import (
     ffi,
     kernel32,
     INVALID_HANDLE_VALUE,
+    ULONG_MAX,
     ErrorCodes,
     FileFlags,
     FileNotifyFlags,
@@ -46,30 +47,32 @@ class NativeEvent:
         return f'NativEvent(action={self.action}, path={self.path})'
 
 
+class FileEvent:
+    """Higher level representation of events happening to monitored files."""
+    def __init__(self, path):
+        self.path = path
+
+class FileAddedEvent(FileEvent): pass
+class FileModifiedEvent(FileEvent): pass
+class FileRemovedEvent(FileEvent): pass
+class FileRenamedEvent(FileEvent):
+    def __init__(self, old_path, new_path):
+        self.old_path = old_path
+        self.new_path = new_path
+class FileScanNeededEvent(FileEvent):
+    def __init__(self):
+        pass
+
+
 class WatchError(Exception):
     pass
 
-class ScanNeededError(WatchError):
-    def __init__(self):
-        super().__init__('Changes occurred but could not be stored in the internal buffer.  A manual scan of the target needs to be performed.')
 
-
-class Watcher:
-    def __init__(self, initial_buffer_size=2**10):
-        self.buffer_size = initial_buffer_size
-        self.listeners = []
-        self._native_events = []
-
-    def register_listener(self, listener):
-        send_channel, recieve_channel = trio.open_memory_channel(math.inf)
-        self.listeners.append(send_channel)
-        listener.set_recieve_channel(recieve_channel)
-
-    @staticmethod
-    def _create_handle(path_name):
-        """Open a handle to `file_name` appropriate for monitoring with IOCP
-           and ReadDirectoryChanges.
-        """
+class FileHandle:
+    """Open a file handle to `file_name` with appropriate settings for
+        monitoring with ReadDirectoryChanges and IOCP.
+    """
+    def __init__(self, path_name):
         # Encode the file name
         rawname = str(path_name).encode('utf-16le') + b'\0\0'
         rawname = ffi.from_buffer(rawname)
@@ -87,7 +90,37 @@ class Watcher:
         )
         if handle == INVALID_HANDLE_VALUE:
             raise_winerror()
-        return handle
+        self._handle = handle
+
+    def __enter__(self, *args, **kwargs):
+        return self
+
+    def __exit__(self, *args, **kwargs):
+        kernel32.CloseHandle(self.win32_handle)
+
+    @property
+    def win32_handle(self):
+        return self._handle
+
+
+class Watcher:
+    def __init__(self, initial_buffer_size=2**10):
+        self.buffer_size = initial_buffer_size
+        self.listeners = []
+
+    @property
+    def buffer_size(self):
+        return self._buffer_size
+
+    @buffer_size.setter
+    def buffer_size(self, buffer_size):
+        """Buffer size for OVERLAPPED is a ULONG, so can't exceede that size."""
+        self._buffer_size = max(1, min(buffer_size, ULONG_MAX))
+
+    def create_event_reciever(self):
+        send_channel, recieve_channel = trio.open_memory_channel(math.inf)
+        self.listeners.append(send_channel)
+        return recieve_channel
 
     def _read_directory_changes(self, handle, overlapped):
         # Types of changes we want to be notified of
@@ -104,7 +137,7 @@ class Watcher:
         # 'watch' multiple times
         buffer =  ffi.from_buffer(bytearray(self.buffer_size))
         result = kernel32.ReadDirectoryChangesW(
-            handle,
+            handle.win32_handle,
             buffer,
             self.buffer_size,
             True,       # bWatchSubtree
@@ -117,85 +150,107 @@ class Watcher:
             raise_winerror()
         return buffer
 
-    def _read_buffer(self, buffer, number_of_bytes):
+    @staticmethod
+    def _read_buffer(buffer, number_of_bytes):
         offset = 0
+        events = []
         while offset < number_of_bytes:
             notify_info = ffi.cast('PFILE_NOTIFY_INFORMATION', buffer[offset:number_of_bytes])
-            self._native_events.append(NativeEvent(notify_info))
+            events.append(NativeEvent(notify_info))
             offset = notify_info.NextEntryOffset
             if offset == 0:
                 # 0 indicates this was the last entry
                 offset = number_of_bytes
+        return events
+
+    @staticmethod
+    def _fold_events(native_events):
+        """Merge renamed_old and renamed_new events."""
+        renamed_source = None
+        events = []
+        for idx, event in enumerate(native_events):
+            if event.is_renamed_old:
+                renamed_source = event
+            elif event.is_renamed_new:
+                events.append(FileRenamedEvent(renamed_source.path, event.path))
+            elif event.is_added:
+                events.append(FileAddedEvent(event.path))
+            elif event.is_modified:
+                events.append(FileModifiedEvent(event.path))
+            elif event.is_removed:
+                events.append(FileRemovedEvent(event.path))
+        return events
 
     async def watch(self, directory):
-        ## NOTE: currently reuses a common buffer, so should only be entered once
-        handle = self._create_handle(directory)
-        print('Watching:', directory)
-        # Register with IOCP so we can await an overlapped result
-        trio.lowlevel.register_with_iocp(handle)
-        # Create an OVERLAPPED structure to 'recieve' the results
-        overlapped = ffi.new('LPOVERLAPPED')
-        # Loop indefinitely
-        self._native_events = []
-        while True:
-            # Notify windows we want to ReadDirectoryChanges with results delivered via IOCP
-            buffer = self._read_directory_changes(handle, overlapped)
-            # And await the results
-            try:
-                result = await trio.lowlevel.wait_overlapped(handle, overlapped)
-            except OSError as e:
-                if e.winerror == ErrorCodes.ERROR_NOTIFY_ENUM_DIR:
-                    # The buffer was not large enough, we need to manually walk the directory
-                    # to find the changes.
-                    # Raise the buffer size to avoid this next call
-                    self.buffer_size *= 2
-                    # And notify the user that they need to walk.
-                    raise ScanNeededError() from None
+        with FileHandle(directory) as handle:
+            print('Watching:', directory)
+            # Register with IOCP so we can await an overlapped result
+            trio.lowlevel.register_with_iocp(handle.win32_handle)
+            # Create an OVERLAPPED structure to 'recieve' the results
+            overlapped = ffi.new('LPOVERLAPPED')
+            # Loop indefinitely
+            while True:
+                # Notify windows we want to ReadDirectoryChanges with results delivered via IOCP
+                buffer = self._read_directory_changes(handle, overlapped)
+                # And await the results
+                try:
+                    result = await trio.lowlevel.wait_overlapped(handle.win32_handle, overlapped)
+                except OSError as e:
+                    if e.winerror == ErrorCodes.ERROR_NOTIFY_ENUM_DIR:
+                        # The buffer was not large enough, we need to manually walk the directory
+                        # to find the changes.
+                        # Raise the buffer size to avoid this next call
+                        self.buffer_size *= 2
+                        print('New buffer size:', self.buffer_size)
+                        # And notify the user that they need to walk.
+                        events = [FileScanNeededEvent()]
+                    else:
+                        raise e from None
                 else:
-                    raise e from None
-            # Unpack the file notify informations
-            self._read_buffer(buffer, result.dwNumberOfBytesTransferred)
-            # Send the events to the listeners
-            for event in self._native_events:
-                for listener in self.listeners:
-                    await listener.send(event)
-            self._native_events.clear()
-            ## TODO: convert events to a higher level representation,
-            ## for example folding rename_old and rename_new events into
-            ## a single rename event (hence the buffer)
+                    # No error: unpack the file notify informations
+                    native_events = self._read_buffer(buffer, result.dwNumberOfBytesTransferred)
+                    # And convert to higher level events
+                    events = self._fold_events(native_events)
+                # Send the events to the listeners
+                for event in events:
+                    to_remove = []
+                    for listener in self.listeners:
+                        try:
+                            await listener.send(event)
+                        except trio.BrokenResourceError:
+                            # The listener closed its recieve channel
+                            to_remove.append(listener)
+                    # Clean out closed recieve channels
+                    for remove in to_remove:
+                        self.listeners.remove(remove)
         print('Stopped watching:', directory)
 
 
 class Listener:
-    def __init__(self):
-        self.recieve_channel = None
-
-    def set_recieve_channel(self, recieve_channel):
-        self.recieve_channel = recieve_channel
-
-    async def listen(self):
-        async for event in self.recieve_channel:
-            await self.on_event(event)
+    async def listen(self, recieve_channel):
+        async with recieve_channel: # Automatically closes if the watcher closes the send_channel
+            async for event in recieve_channel:
+                await self.on_event(event)
 
     async def on_event(self, event):
-        if event.is_added:
+        if isinstance(event, FileAddedEvent):
             await self.on_added(event.path)
-        elif event.is_modified:
+        elif isinstance(event, FileModifiedEvent):
             await self.on_modified(event.path)
-        elif event.is_removed:
+        elif isinstance(event, FileRemovedEvent):
             await self.on_removed(event.path)
-        elif event.is_renamed_old:
-            await self.on_renamed_old(event.path)
-        elif event.is_renamed_new:
-            await self.on_renamed_new(event.path)
+        elif isinstance(event, FileRenamedEvent):
+            await self.on_renamed(event.old_path, event.new_path)
+        elif isinstance(event, FileScanNeededEvent):
+            await self.on_scan_needed()
         else:
             raise Watcher(f'Unknown file event type: {event}')
 
     async def on_added(self, path): pass
     async def on_modified(self, path): pass
     async def on_removed(self, path): pass
-    async def on_renamed_old(self, path): pass
-    async def on_renamed_new(self, path): pass
+    async def on_renamed(self, old_path, new_path): pass
+    async def on_scan_needed(self): pass
 
 
 class PrintListener(Listener):
@@ -208,19 +263,18 @@ class PrintListener(Listener):
     async def on_removed(self, path):
         print('File Removed:', path)
 
-    async def on_renamed_old(self, path):
-        print('File Renamed, old path:', path)
+    async def on_renamed(self, old_path, new_path):
+        print('File Renamed:', old_path, '->', new_path)
 
-    async def on_renamed_new(self, path):
-        print('File Renamed, new path:', path)
+    async def on_scan_needed(self):
+        print('Scan needed!')
 
 
 async def main(directory):
     async with trio.open_nursery() as nursery:
         listener = PrintListener()
         watcher = Watcher()
-        watcher.register_listener(listener)
-        nursery.start_soon(listener.listen)
+        nursery.start_soon(partial(listener.listen, watcher.create_event_reciever()))
         nursery.start_soon(partial(watcher.watch, directory))
 
 
