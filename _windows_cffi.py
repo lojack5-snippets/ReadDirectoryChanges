@@ -1,6 +1,6 @@
 import enum
 
-from trio._core._io_windows import ffi, kernel32
+from trio._core._io_windows import ffi, kernel32, raise_winerror
 
 ## Additional definitions needed to trio's FFI instance
 ## Mixing FFI instances can cause issues, so reuse trio's
@@ -71,15 +71,3 @@ class FileAction(enum.IntEnum):
 
 def unpack_pascal_string(string_pointer, string_length):
     return ffi.buffer(string_pointer, string_length)[:].decode('utf-16le')
-
-
-def get_winerror(winerror=None, *, filename=None, filename2=None):
-    if winerror is None:
-        winerror, msg = ffi.getwinerror()
-    else:
-        _, msg = ffi.getwinerror(winerror)
-    # https://docs.python.org/3/library/exceptions.html#OSError
-    return OSError(0, msg, filename, winerror, filename2)
-
-def raise_winerror(winerror=None, *, filename=None, filename2=None):
-    raise get_winerror(winerror, filename=filename, filename2=filename2)

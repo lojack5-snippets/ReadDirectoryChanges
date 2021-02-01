@@ -27,7 +27,9 @@ async def main(directory):
         listener = PrintListener()
         watcher = Watcher()
         nursery.start_soon(partial(listener.listen, watcher.create_event_reciever()))
+        print('Watching:', directory)
         nursery.start_soon(partial(watcher.watch, directory))
+    print('Finished watching.')
 
 
 if __name__ == '__main__':

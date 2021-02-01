@@ -14,7 +14,6 @@ from _windows_cffi import (
     FileAction,
     unpack_pascal_string,
     raise_winerror,
-    get_winerror,
 )
 
 class NativeEvent:
@@ -182,7 +181,6 @@ class Watcher:
 
     async def watch(self, directory):
         with FileHandle(directory) as handle:
-            print('Watching:', directory)
             # Register with IOCP so we can await an overlapped result
             trio.lowlevel.register_with_iocp(handle.win32_handle)
             # Create an OVERLAPPED structure to 'recieve' the results
@@ -200,7 +198,6 @@ class Watcher:
                         # to find the changes.
                         # Raise the buffer size to avoid this next call
                         self.buffer_size *= 2
-                        print('New buffer size:', self.buffer_size)
                         # And notify the user that they need to walk.
                         events = [FileScanNeededEvent()]
                     else:
@@ -222,7 +219,6 @@ class Watcher:
                     # Clean out closed recieve channels
                     for remove in to_remove:
                         self.listeners.remove(remove)
-        print('Stopped watching:', directory)
 
 
 class Listener:
@@ -243,7 +239,7 @@ class Listener:
         elif isinstance(event, FileScanNeededEvent):
             await self.on_scan_needed()
         else:
-            raise Watcher(f'Unknown file event type: {event}')
+            raise WatchError(f'Unknown file event type: {event}')
 
     async def on_added(self, path): pass
     async def on_modified(self, path): pass
